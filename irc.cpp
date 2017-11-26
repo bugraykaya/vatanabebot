@@ -96,7 +96,7 @@ void senderThread()
         int newMsec = GetTickCount();
         int diff = newMsec - msec;
         msec = newMsec;
-        Sleep( (diff < 1500 ) * ( 1500 - diff) ); // make sure to wait at least 1.5 seconds before sending another message.
+        Sleep( (diff < 1500 ) * ( 1500 - diff) );
         flushMessageQueue();
         
     }
