@@ -1,4 +1,4 @@
-//TODO: Biggest issue right now is file management.
+
 
 #include "STCPSocket.h"
 #include <stdlib.h>
