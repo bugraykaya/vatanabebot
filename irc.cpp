@@ -18,7 +18,7 @@
 #pragma comment (lib, "Mswsock.lib")
 #pragma comment (lib, "AdvApi32.lib")
 
-
+#define MESSAGE_DELAY 2500
 #define MESSAGE_SAVE_SUCCESS 0
 #define MESSAGE_SAVE_NO_USER 1         
 #define MESSAGE_SAVE_USER_ACTIVE 2 
@@ -39,6 +39,8 @@ bool loadEntries(const char *fileName , std::map<std::string, UserEntry> &entrie
 void parseMessage(char *, Message & );
 int tryToSaveMessage(Message& , std::map<std::string, UserEntry> & entries , std::stringstream &outputString);
 void sendMessage(SOCKET *s, const char* message);
+void flushMessageQueue();
+void inputThread();
 BOOL WINAPI sigintFunc(DWORD signal);
 
 //globals
@@ -46,70 +48,53 @@ const uint8_t envelope[3]= {0xE2, 0x9C, 0x89}; //utf-8 envelope emoji
 char gMessagePrefix[512];
 char gChannel[50];
 bool running = true;
+bool gUnsaved = false;
 std::queue<std::string> gMessageQueue;
+std::map<std::string, UserEntry> entries;
+
 std::condition_variable gCV;
-std::mutex gCVMutex;
-std::unique_lock<std::mutex> gSenderThreadLock(gCVMutex);
+
+std::condition_variable gSaveCV;
+
 std::mutex gQueueLock;
+std::mutex gEntriesLock;
 STCPSocket gSocket;
 
-void flushMessageQueue()
+void saveThread()
 {
-    std::stringstream ss ;
-    ss << gMessagePrefix;
+    std::mutex CVMutex;
+    std::unique_lock<std::mutex> CVLock(CVMutex);
     
-    gQueueLock.lock();
-    
-    if(!gMessageQueue.empty())
+    while(running)
     {
-        ss << gMessageQueue.front();
-        gMessageQueue.pop();
-        if(gMessageQueue.empty())
-        {
-            ss<<"\r\n";
-            gSocket.STsend(ss.str().c_str(), ss.str().size()+1);
-        }
-    }
-    while( !gMessageQueue.empty())
-    {
-        while(ss.str().size()<=100 && !gMessageQueue.empty())
-        {
-            std::string front =gMessageQueue.front(); 
-            ss<<'#'<< front;
-            gMessageQueue.pop();
-            
-        }
-        ss<<"\r\n";
-        gSocket.STsend(ss.str().c_str(), ss.str().size()+1);
+        if(gSaveCV.wait_for(CVLock, std::chrono::minutes(5)) == std::cv_status::timeout && gUnsaved)
+            printf("5 minutes passed. Saving\n");
+        else
+            printf("Exiting program\n");
         
+        gEntriesLock.lock();
+        saveEntriesToFile("entries.txt" , entries);
+        gUnsaved = false;
+        gEntriesLock.unlock();
     }
-    
-    gQueueLock.unlock();
 }
 
 void senderThread()
 {
+    std::mutex CVMutex;
+    std::unique_lock<std::mutex> CVLock(CVMutex);
+    
     int msec = GetTickCount();
     while(running)
     {
-        gCV.wait(gSenderThreadLock);
+        gCV.wait(CVLock);
         int newMsec = GetTickCount();
         int diff = newMsec - msec;
         msec = newMsec;
-        Sleep( (diff < 1500 ) * ( 1500 - diff) );
+        Sleep( (diff < MESSAGE_DELAY ) * ( MESSAGE_DELAY - diff) ); 
         flushMessageQueue();
         
     }
-}
-
-void inputThread()
-{
-    while(getchar() != 'q')
-    {
-        printf("not q\n");
-    }
-    printf("is q\n");
-    running = false;
 }
 
 int  main(int argc, char **argv) 
@@ -168,10 +153,6 @@ int  main(int argc, char **argv)
     
     fflush(stdout);
     Message msg;
-    std::stringstream ss;
-    ss << gMessagePrefix <<envelope<<"\r\n";
-    gSocket.STsend(ss.str().c_str(), ss.str().size() +1 );
-    iResult = gSocket.STrecv( recvbuf, recvbuflen);
     
     recvbuf[iResult] = 0;
     ZeroMemory(recvbuf,  recvbuflen);
@@ -180,17 +161,23 @@ int  main(int argc, char **argv)
     
     std::thread cmdLineInputThread(inputThread);
     std::thread msgSenderThread(senderThread);
+    std::thread saveFileThread(saveThread);
     
-    std::map<std::string, UserEntry> entries;
     result = loadEntries("entries.txt" , entries);
     if(result)
         printf("Loaded %zd entries\n", entries.size());
     else 
         printf("Could not load entries\n");
     
+    std::stringstream ss;
+    ss << gMessagePrefix <<envelope<<"\r\n";
+    gSocket.STsend(ss.str().c_str(), ss.str().size() +1 );
+    iResult = gSocket.STrecv( recvbuf, recvbuflen);
+    
+    
     do{
         
-        iResult = gSocket.STrecv(recvbuf, recvbuflen);
+        iResult = gSocket.STrecv(recvbuf, recvbuflen-1);
         recvbuf[iResult] = 0;
         
         if ( iResult > 0 )
@@ -225,7 +212,8 @@ int  main(int argc, char **argv)
                     std::stringstream ss;
                     int numberOfMessages = iterator->second.messages.size();
                     ss<< gMessagePrefix << "Welcome back, "<<msg.username<<" . You have "<< numberOfMessages << " new messages. Type !list to see them.\r\n";
-                    gSocket.STsend(ss.str().c_str() , ss.str().size()+1 );
+                    std::string str = ss.str();
+                    gSocket.STsend(str.c_str() , str.size()+1 );
                 }
                 
             }
@@ -234,7 +222,10 @@ int  main(int argc, char **argv)
             {
                 std::stringstream outputString;
                 //outputString << gMessagePrefix;
+                gEntriesLock.lock();
                 int result = tryToSaveMessage(msg, entries, outputString);
+                gUnsaved = true;
+                gEntriesLock.unlock();
                 gQueueLock.lock();
                 gMessageQueue.push(outputString.str());
                 gQueueLock.unlock();
@@ -250,7 +241,8 @@ int  main(int argc, char **argv)
                 {
                     std::stringstream ss;
                     ss<< gMessagePrefix<< "You have no new messages.\r\n";
-                    gSocket.STsend(ss.str().c_str(), ss.str().size()+1);
+                    std::string str = ss.str();
+                    gSocket.STsend(str.c_str(), str.size()+1);
                 }
                 else
                 {
@@ -259,9 +251,10 @@ int  main(int argc, char **argv)
                     {
                         std::stringstream ss;
                         ss <<gMessagePrefix<< "From "<< iterator->second.messages[i].username<<" " << difftime( time(NULL) ,iterator->second.messages[i].time)<<" seconds ago: "<<iterator->second.messages[i].messageBody<<"\r\n" ;
-                        gSocket.STsend( ss.str().c_str(), ss.str().size()+1);
+                        std::string str = ss.str();
+                        gSocket.STsend( str.c_str(), str.size()+1);
                         iterator->second.messages.pop_back();
-                        Sleep(1500);
+                        Sleep(MESSAGE_DELAY);
                         
                     }
                 }
@@ -286,7 +279,8 @@ int  main(int argc, char **argv)
                     printf("user is %s\n",wantedName.c_str());
                     std::stringstream ssToSend;
                     ssToSend <<gMessagePrefix<< wantedName <<" 's last message was "<< difftime( msg.time , wantedUserIterator->second.lastSeen )<< " seconds ago.\r\n";
-                    gSocket.STsend( ssToSend.str().c_str() , ssToSend.str().size()+1 );
+                    std::string str = ssToSend.str();
+                    gSocket.STsend( str.c_str() , str.size()+1 );
                 }
                 else printf("User %s not found\n", wantedName.c_str());
             }
@@ -309,10 +303,13 @@ int  main(int argc, char **argv)
     }while(running);
     
     gCV.notify_one();
+    gSaveCV.notify_one();
     
-    saveEntriesToFile("entries.txt" , entries);
+    //saveEntriesToFile("entries.txt" , entries);
     cmdLineInputThread.join();
     msgSenderThread.join();
+    saveFileThread.join();
+    
     return 0;
 }
 
@@ -471,3 +468,48 @@ BOOL WINAPI sigintFunc(DWORD signal)
     
 }  
 
+void flushMessageQueue()
+{
+    std::stringstream ss ;
+    ss << gMessagePrefix;
+    
+    gQueueLock.lock();
+    
+    if(!gMessageQueue.empty())
+    {
+        ss << gMessageQueue.front();
+        gMessageQueue.pop();
+        if(gMessageQueue.empty())
+        {
+            ss<<"\r\n";
+            gSocket.STsend(ss.str().c_str(), ss.str().size()+1);
+            
+        }
+    }
+    while( !gMessageQueue.empty())
+    {
+        Sleep(MESSAGE_DELAY);
+        while(ss.str().size()<=100 && !gMessageQueue.empty())
+        {
+            std::string front =gMessageQueue.front(); 
+            ss<<'#'<< front;
+            gMessageQueue.pop();
+            
+        }
+        ss<<"\r\n";
+        gSocket.STsend(ss.str().c_str(), ss.str().size()+1);
+    }
+    
+    gQueueLock.unlock();
+}
+
+
+void inputThread()
+{
+    while(getchar() != 'q')
+    {
+        printf("not q\n");
+    }
+    printf("is q\n");
+    running = false;
+}
