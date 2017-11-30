@@ -1,2 +1,2 @@
-# vatanebebot
+# vatanabebot
 Extremely unstable irc bot.
